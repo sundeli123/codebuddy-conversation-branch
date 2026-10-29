@@ -1,0 +1,16 @@
+# 备份的 CodeBuddy 原始文件（属于腾讯的代码，绝不能提交）
+backup/
+*.bak-*.js
+
+# 运行时产物
+out/
+*.log
+probe.log
+error.log
+pending.json
+
+# 依赖与系统文件
+node_modules/
+Thumbs.db
+desktop.ini
+.DS_Store
