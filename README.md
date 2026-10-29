@@ -26,7 +26,7 @@ CodeBuddy 的对话历史存在**扩展宿主进程的内存里**。会话列表
 ## 安装（Windows）
 
 ```powershell
-git clone https://github.com/<your-name>/codebuddy-conversation-branch.git
+git clone https://github.com/sundeli123/codebuddy-conversation-branch.git
 cd codebuddy-conversation-branch
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
