@@ -8,6 +8,9 @@ out/
 probe.log
 error.log
 pending.json
+req-*.json
+ack-*.json
+imported-*.json
 
 # 依赖与系统文件
 node_modules/
