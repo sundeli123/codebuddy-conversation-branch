@@ -2,7 +2,7 @@
 <#
     codebuddy-conversation-branch  卸载（Windows）
       1. 用 backup/ 里最新的备份恢复 CodeBuddy 的 genie 扩展
-      2. 删除本地扩展
+      2. 删除本地扩展（所有版本目录都删）
 #>
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -31,14 +31,18 @@ if (-not $target) {
     Write-Ok ('已从 ' + $bak.Name + ' 恢复')
 }
 
-# ---------- 2. 删除扩展 ----------
+# ---------- 2. 删除扩展（所有版本） ----------
 Write-Step '删除扩展'
-$extDir = Join-Path $env:USERPROFILE '.codebuddycn\extensions\local.codebuddy-branch-0.1.0'
-if (Test-Path -LiteralPath $extDir) {
-    Remove-Item -LiteralPath $extDir -Recurse -Force
-    Write-Ok '已删除 ' + $extDir
-} else {
+$extRoot = Join-Path $env:USERPROFILE '.codebuddycn\extensions'
+$found = @(Get-ChildItem -LiteralPath $extRoot -Directory -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -like 'local.codebuddy-branch-*' })
+if ($found.Count -eq 0) {
     Write-Ok '扩展目录不存在，跳过'
+} else {
+    foreach ($d in $found) {
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force
+        Write-Ok ('已删除 ' + $d.Name)
+    }
 }
 
 Write-Host ''
