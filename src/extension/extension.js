@@ -21,6 +21,29 @@ function log(lines) {
 
 function nowIso() { return new Date().toISOString(); }
 
+/**
+ * 该轮提问时刻 → "MM-DD HH:MM"（本地时区）。
+ * 取的是这一轮第一条 user 消息的 createdAt，也就是用户按下发送的时刻
+ * （不用 requests[].startedAt：那是后端开始处理的时间，通常晚几秒）。
+ * 缺失/非法时返回空串，调用方据此省略这一段，不留空的 "｜"。
+ */
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/** 路径归一化：统一分隔符、去尾斜杠、小写。必须与宿主补丁里的 norm() 完全一致 */
+function normWs(p) {
+  return String(p || '').split('\\').join('/').replace(/\/+$/, '').toLowerCase();
+}
+
+function newTaskId() {
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
+
 function workspacePath() {
   const f = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
   if (!f) throw new Error('当前窗口没有打开工作区');
@@ -93,11 +116,40 @@ function buildArchive(wsPath, convId, roundNo) {
   };
 }
 
-function enqueue(archive) {
+/**
+ * 投递任务。必须是「一个任务一个文件 + 带目标工作区」：
+ * 队列目录是全机共用的，开着多个 CodeBuddy 窗口时每个窗口的宿主补丁都在轮询，
+ * 旧写法（单个 pending.json、谁先抢到算谁的）会把分支导进别的工作区历史里，
+ * 当前窗口反而看不到。
+ */
+function enqueue(archive, taskId, ws) {
   fs.mkdirSync(QUEUE_DIR, { recursive: true });
+  archive.__cbbTargetWs = ws;
+  archive.__taskId = taskId;
+  const file = path.join(QUEUE_DIR, 'req-' + taskId + '.json');
   const json = JSON.stringify(archive);
-  fs.writeFileSync(PENDING, json, 'utf8');
-  return Buffer.byteLength(json, 'utf8');
+  fs.writeFileSync(file, json, 'utf8');
+  return { file, bytes: Buffer.byteLength(json, 'utf8') };
+}
+
+/** 等宿主补丁回执：它真正调完官方导入链路后才会写 ack-<taskId>.json */
+function waitAck(taskId, ms) {
+  const ackPath = path.join(QUEUE_DIR, 'ack-' + taskId + '.json');
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const t = setInterval(() => {
+      if (fs.existsSync(ackPath)) {
+        clearInterval(t);
+        let obj = null;
+        try { obj = JSON.parse(fs.readFileSync(ackPath, 'utf8')); } catch { obj = { ok: false, error: '回执文件损坏' }; }
+        try { fs.unlinkSync(ackPath); } catch { /* ignore */ }
+        resolve(obj);
+      } else if (Date.now() - start >= ms) {
+        clearInterval(t);
+        resolve(null);
+      }
+    }, 300);
+  });
 }
 
 async function branchCommand() {
@@ -139,7 +191,9 @@ async function branchCommand() {
     // 普通扩展一用就报 "CANNOT use API proposal"，所以不用它。
     // label 用纯字符串（不要用 {label,highlights} 对象，实测会让列表渲染为空）。
     const mark = (hit && r.round === hit.round) ? '★ ' : '';
-    const prefix = isFull ? '第 ' + r.round + ' 轮（全量）｜' : '第 ' + r.round + ' 轮｜';
+    const when = fmtDateTime(r.createdAt);
+    const prefix = (isFull ? '第 ' + r.round + ' 轮（全量）｜' : '第 ' + r.round + ' 轮｜')
+      + (when ? when + '｜' : '');
     return {
       label: mark + prefix + head,
       // detail 放完整问题（从第 1 字起）：
@@ -170,26 +224,22 @@ async function branchCommand() {
   if (!picked) return;
 
   const archive = buildArchive(ws, convId, picked.round);
-  const bytes = enqueue(archive);
+  const taskId = newTaskId();
+  const { file, bytes } = enqueue(archive, taskId, ws);
+  const title = archive.data.conversations[0].name;
 
-  const waitConsumed = (ms) => new Promise((resolve) => {
-    const start = Date.now();
-    const t = setInterval(() => {
-      if (!fs.existsSync(PENDING)) { clearInterval(t); resolve(true); }
-      else if (Date.now() - start >= ms) { clearInterval(t); resolve(false); }
-    }, 400);
-  });
+  // 只认回执：旧写法"文件消失就算成功"分不清是被本窗口导入了、还是被别的窗口叼走了，
+  // 于是会出现提示"已生成"但历史里找不到的情况。
+  const ack = await waitAck(taskId, 12000);
 
-  let consumed = await waitConsumed(3000);
-  if (!consumed) {
-    // 兜底：宿主侧补丁会自己打开一次历史页来激活；这里只再等一会儿
-    consumed = await waitConsumed(5000);
-  }
-
-  if (consumed) {
-    vscode.window.showInformationMessage('CodeBuddy 分支：已生成「' + archive.data.conversations[0].name + '」');
+  if (ack && ack.ok) {
+    vscode.window.showInformationMessage('CodeBuddy 分支：已生成「' + title + '」');
+  } else if (ack) {
+    vscode.window.showErrorMessage('CodeBuddy 分支导入失败：' + (ack.error || '未知错误'));
+  } else if (fs.existsSync(file)) {
+    vscode.window.showWarningMessage('CodeBuddy 分支：任务文件已生成（' + Math.round(bytes / 1024) + ' KB），但本窗口的宿主补丁没有取走它。补丁需要重启 IDE 才生效（只需一次），重启后再按快捷键即可。');
   } else {
-    vscode.window.showWarningMessage('CodeBuddy 分支：文件已生成（' + Math.round(bytes / 1024) + ' KB），但宿主没消费。补丁可能尚未生效——重启一次 CodeBuddy 即可（只需一次）。');
+    vscode.window.showWarningMessage('CodeBuddy 分支：任务被取走但没有回执，说明取走它的是旧版补丁（可能把分支导进了别的工作区）。请重启 IDE 后重试。');
   }
 }
 
