@@ -1,10 +1,10 @@
-> 本文是开发过程记录，面向接手的人或 AI。安装使用请看仓库根目录 README.md。
-
 # 给 CodeBuddy（腾讯 CodeBuddy IDE）添加「对话分支」功能 —— 完整实现记录
 
-> 记录日期：2026-10-29
+> 本文是开发过程记录，面向接手的人或 AI。安装使用请看仓库根目录 README.md。
+> 记录日期：2026-10-29（2026-10-30 更新到 v0.2.0）
 > 环境：Windows 11 / CodeBuddy CN IDE 1.106.1 / genie 扩展 3.10.0 / CodeBuddy Code CLI 2.151.0
 > 面向读者：以后接手的 AI 或人。**先读完本文再动手，尤其第 5 节「已确认走不通的路」，不要重复试。**
+> 已开源：https://github.com/sundeli123/codebuddy-conversation-branch （本地发布目录 `C:\Users\21078\Desktop\软件\codebuddy-conversation-branch`）
 
 ---
 
@@ -15,7 +15,16 @@ CodeBuddy 本身没有 DeepSeek Harness 那种「在某一轮对话处分叉出�
 - 按一次快捷键 → 选择某一轮 → **1~2 秒后新分支自动出现在历史列表**；
 - **不重载窗口、不重启 IDE、不打断正在跑的 AI 任务**；
 - 支持「复制任意消息 → 按快捷键 → 自动定位到那一轮」（方案 A）；
-- 分支内容 = 该轮及其之前的全部对话，原对话完全不受影响。
+- 分支内容 = 该轮及其之前的全部对话，原对话完全不受影响；
+- 列表第一行带**该轮提问时刻** `MM-DD HH:MM`，方便按时间认轮次；
+- v0.2.0 起，分支**只会落到发起窗口自己的工作区**（v0.1.0 会导进别的工作区，见 6.1.1）。
+
+### 版本记录
+
+| 版本 | 日期 | 变化 |
+|---|---|---|
+| v0.1.0 | 2026-10-29 | 首个可用版本：任意轮分叉、剪贴板定位、不打断任务 |
+| **v0.2.0** | 2026-10-30 | ① 队列改为 `req-<taskId>.json` + 目标工作区定向，修「分支被别的窗口截胡、导进别的工作区」；② 导入回执 `ack-<taskId>.json`，扩展不再假报「已生成」；③ 列表第一行加提问时间戳；④ `patch-genie.js apply` 支持从 v1 原地升级到 v2 |
 
 ---
 
@@ -37,15 +46,17 @@ CodeBuddy 本身没有 DeepSeek Harness 那种「在某一轮对话处分叉出�
 [用户按 Ctrl+Alt+B]
         │
         ▼
-[本地扩展 codebuddy-branch]  ← ~/.codebuddycn/extensions/local.codebuddy-branch-0.1.0
+[本地扩展 codebuddy-branch]  ← ~/.codebuddycn/extensions/local.codebuddy-branch-0.2.0
    1. 读当前会话 id
-   2. 列出所有轮次（QuickPick，两行展示）
+   2. 列出所有轮次（QuickPick，两行展示：轮次｜MM-DD HH:MM｜问题前 30 字）
    3. （方案 A）读剪贴板，匹配到某一轮，置顶加 ★
-   4. 用磁盘数据构造「归档 JSON」，写到 %TEMP%\codebuddy-branch\pending.json
+   4. 用磁盘数据构造「归档 JSON」，写到 %TEMP%\codebuddy-branch\req-<taskId>.json
+      （任务体带 __cbbTargetWs = 本窗口工作区）
         │
         ▼
-[genie 扩展里的补丁]  ← 每 1.2 秒轮询 pending.json
-   发现文件 → 调用它自己的 importArchiveFromJsonText(text)
+[genie 扩展里的补丁]  ← 每 1.2 秒轮询 req-*.json
+   目标工作区不是自己的 → 跳过（交给正主窗口，见 6.1.1）
+   是自己的 → 改名取走 → 调用它自己的 importArchiveFromJsonText(text)
         │
         ▼
 [CodeBuddy 官方导入链路]
@@ -54,7 +65,8 @@ CodeBuddy 本身没有 DeepSeek Harness 那种「在某一轮对话处分叉出�
    → onConversationCreatedEmitter.fire({ setAsCurrent: false })
         │
         ▼
-   历史列表立刻多一条，当前对话不切走、任务不中断
+   导入成功/失败写回执 ack-<taskId>.json
+   扩展等到回执才提示「已生成」，历史列表立刻多一条，当前对话不切走、任务不中断
 ```
 
 **为什么必须打补丁**：导入的最后一步是在宿主进程内存里 fire 一个事件，外部进程（包括另一个 VS Code 扩展）无法触发。详见第 5 节。
@@ -247,7 +259,7 @@ Its package.json#enabledApiProposals-property declares: [] but NOT quickPickItem
 
 ### 6.1 补丁：给 genie 扩展加「自动导入」
 
-文件：`%LOCALAPPDATA%\Programs\CodeBuddy CN\resources\app\extensions\genie\out\extension\index.js`
+文件：`C:\Users\21078\AppData\Local\Programs\CodeBuddy CN\resources\app\extensions\genie\out\extension\index.js`
 （约 21 MB 的单行 webpack bundle；改前必须备份）
 
 **三处插入**（脚本见 `patch-genie.js`）：
@@ -259,14 +271,19 @@ Its package.json#enabledApiProposals-property declares: [] but NOT quickPickItem
 
 ```js
 setInterval(() => {
-  const p = path.join(os.tmpdir(), 'codebuddy-branch', 'pending.json');
-  if (!fs.existsSync(p)) return;
-  if (Date.now() - fs.statSync(p).mtimeMs < 400) return;   // 防半截文件
-  const svc = globalThis.__cbbSvc;
-  if (!svc) { /* 尝试打开一次历史页激活，并提示一次 */ return; }
-  const text = fs.readFileSync(p, 'utf8');
-  fs.renameSync(p, done);                                   // 原子改名，天然防重复
-  svc.importArchiveFromJsonText(text);                       // ← 走官方链路
+  const dir = path.join(os.tmpdir(), 'codebuddy-branch');
+  for (const name of fs.readdirSync(dir)) {                  // req-<taskId>.json / 旧 pending.json
+    if (!/^(req-.*\.json|pending\.json)$/.test(name)) continue;
+    const task = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (norm(task.__cbbTargetWs) !== norm(myWorkspace())) continue;  // 不是本窗口的任务，跳过
+    if (Date.now() - fs.statSync(p).mtimeMs < 400) continue;         // 防半截文件
+    const svc = globalThis.__cbbSvc;
+    if (!svc) { /* 尝试打开一次历史页激活，并提示一次 */ return; }
+    fs.renameSync(p, done);                                          // 原子改名，天然防重复
+    svc.importArchiveFromJsonText(text)
+      .then(() => ack(id, { ok: true }))                              // ← 走官方链路
+      .catch((e) => ack(id, { ok: false, error: e.message }));
+  }
 }, 1200);
 ```
 
@@ -274,20 +291,54 @@ setInterval(() => {
 
 - **用的是它自己的 `importArchiveFromJsonText`**，不伪造事件、不手写 `index.json`；
 - `renameSync` 是原子的：多窗口同时轮询也只会有一个成功消费；
+- **只消费目标工作区等于自己的工作区的任务**，否则多个窗口会互相截胡（6.1.1）；
 - 补丁只增 1000 多字符，`node --check` 通过；
-- **IDE 升级会覆盖这个文件**，需要重新 apply。
+- **IDE 升级会覆盖这个文件**，需要重新 apply（`node patch-genie.js apply`；已是 v1 的会原地升级到 v2）。
+
+#### 6.1.1 v2（2026-10-30）：分支被导进了别的工作区 —— 必须按工作区定向
+
+**现象**：按 Ctrl+Alt+B 选完轮次，提示「已生成」，但当前窗口历史列表里没有新分支，index.json 也没新增会话。
+
+**根因**（实测证据，7 次点击全中招）：
+
+| 时间 | 实际落到的工作区目录 | 结果 |
+|---|---|---|
+| 22:21:38 / 22:22:31 / 22:22:54 / 22:24:05 / 22:25:26 / 22:25:36 | `127e2daa…`（另一个窗口的项目） | 都生成了「… · 分支(全量)」 |
+| 22:23:14 | `305f2ae7…` | 「… · 分支5」 |
+| 发起操作的窗口 `d4c8c0e7…` | **0 条** | 所以看不到 |
+
+- `%TEMP%\codebuddy-branch\pending.json` 是**全机唯一的队列文件**，而**每个打开的 CodeBuddy 窗口**里都有一份 genie 补丁在每 1.2 秒抢同一个文件 —— 谁先抢到，就由谁（也就是那个窗口的工作区）去执行导入；
+- 发起窗口自己的补丁可能还没捕获到导入服务实例（`__cbbSvc` 为空），于是它永远不消费；别的窗口捕获过，于是次次截胡；
+- 旧扩展只看「pending.json 还在不在」，文件被任何窗口叼走就立刻弹「已生成」，完全无法区分「真导入了」和「被抢走了」。
+
+**v2 改法**：
+
+1. 队列改成一任务一文件：`%TEMP%\codebuddy-branch\req-<taskId>.json`（不再写 `pending.json`）；
+2. 任务体顶层带 `__cbbTargetWs`（发起窗口的工作区绝对路径）+ `__taskId`；
+3. 补丁读任务后先比对目标：`norm(__cbbTargetWs) !== norm(本窗口 workspaceFolders[0])` 就直接跳过、**不改名不删除**，留给正主窗口消费；
+4. 导入结束写回执 `ack-<taskId>.json`（成功 `{ok:true}`，失败 `{ok:false,error}`），失败另写 `import-error.log` 完整堆栈；
+5. 扩展改为等回执（12 秒）再提示，超时区分三种情况：任务还在（补丁没生效）/ 任务被取走但无回执（旧版补丁截胡）/ 有回执（真结果）。
+
+> 顶层 `__cbbTargetWs` / `__taskId` 不会进导入数据：`parseConversationArchive` 只校验并返回 `data`，未知顶层字段被忽略（`_meta` 早已验证过这一点）。
+
+**代价与边界**：
+
+- 所有开着的窗口都要重启一次，旧版补丁才会被换成 v2；在那之前旧窗口仍会截胡任何 `pending.json`（v2 已不写这个文件）。
+- 同一项目开两个窗口时两者目标相同，仍可能任选其一消费 —— 但历史目录相同，结果正确。
+- 已经误投到别的工作区的会话不会自动清理，需要手工删除。
 
 ### 6.2 扩展：`codebuddy-branch`
 
-安装目录：`%USERPROFILE%\.codebuddycn\extensions\local.codebuddy-branch-0.1.0\`
+安装目录：`C:\Users\21078\.codebuddycn\extensions\local.codebuddy-branch-0.2.0\`
 
 文件：
 
 | 文件 | 作用 |
 |---|---|
 | `package.json` | 两个命令 + 两个快捷键（`ctrl+alt+b`、`ctrl+alt+j`）；`version` 必须与目录名一致 |
-| `extension.js` | 命令实现：读当前会话 → 列轮次 → QuickPick → 构造归档 → 写 pending.json → 等待被消费 |
+| `extension.js` | 命令实现：读当前会话 → 列轮次 → QuickPick → 构造归档 → 写 `req-<taskId>.json`（带目标工作区）→ 等 `ack-<taskId>.json` 再提示 |
 | `branch-core.js` | 纯 Node 核心：路径解析、轮次切分、文本提取/清洗、剪贴板定位 |
+| `fmtDateTime(iso)`（在 `extension.js` 内） | 该轮提问时刻 → `MM-DD HH:MM`（本地时区），缺失返回空串以省略整段 |
 
 **`branch-core.js` 关键函数**
 
@@ -300,7 +351,10 @@ setInterval(() => {
 **QuickPick 的展示规则（踩过坑后的最终形态）**
 
 - 只显示「我问的问题」，不显示 AI 回复；
-- 第一行：`[★ ]第 N 轮[（全量）]｜<问题前 30 字>`；`label` 必须是**纯字符串**，且**总长必须小于面板可视宽度（实测约 44 字符）**——VS Code 只要发现 label 超宽就会自动加 `…`，无法关闭，一旦超宽第一行末尾永远带省略号；
+- 第一行：`[★ ]第 N 轮[（全量）]｜MM-DD HH:MM｜<问题前 30 字>`；`label` 必须是**纯字符串**，且**总长必须小于面板可视宽度（实测约 44 字符）**——VS Code 只要发现 label 超宽就会自动加 `…`，无法关闭，一旦超宽第一行末尾永远带省略号；
+- 时间戳取**该轮第一条 user 消息的 `createdAt`**（= 用户按下发送的时刻，本地时区），不用 `requests[].startedAt`（那是后端开始处理的时间，通常晚几秒）；`createdAt` 缺失或非法时整段连同分隔符一起省略，不显示空的 `｜`；
+  > 磁盘上没有"AI 回复结束"时间戳，界面上的「耗时 16.9s」是 IDE 自己算的、未落盘。所以只能给提问时刻，给不了耗时。
+  > 加入 `MM-DD HH:MM`（11 个半角 ≈ 5.5 个汉字宽）后第一行比原来宽约 15%，若某天看到第一行末尾出现省略号，把 `HEAD` 从 30 调到 24~26；
 - 第二行：`detail` = **完整问题（从第 1 个字起）**。VS Code 的悬停提示取 detail，所以悬停第二行能看到一字不缺的全文；代价是第二行开头会与第一行前 30 字重复，这是有意为之（用户明确要求「悬停能看到全部」）；
   - 若哪天想改成「两行不重复」，把 `detail` 换成 `full.slice(HEAD)` 即可，但悬停会缺前 30 字；
 - `HEAD`（第一行字数）当前为 30，是按用户面板宽度定的安全值；面板拖窄后若又出现省略号，把它调到 25；
@@ -310,10 +364,10 @@ setInterval(() => {
 
 ```powershell
 # 直接从第 5 轮分叉（不经过扩展界面）
-node %APPDATA%\CodeBuddyBranch\branch-cli.js 5 "E:\项目路径"
+node C:\Users\21078\AppData\Roaming\CodeBuddyBranch\branch-cli.js 5 "E:\项目路径"
 
 # 只生成归档文件（手工在历史页点「导入」）
-node %APPDATA%\CodeBuddyBranch\make-archive.js "E:\项目路径" <会话id> 3 "输出.json"
+node C:\Users\21078\AppData\Roaming\CodeBuddyBranch\make-archive.js "E:\项目路径" <会话id> 3 "输出.json"
 ```
 
 ### 6.4 方案 A：复制即定位
@@ -332,7 +386,7 @@ node %APPDATA%\CodeBuddyBranch\make-archive.js "E:\项目路径" <会话id> 3 "�
 
 1. 在 CodeBuddy 对话里按 `Ctrl+Alt+B`（或 `Ctrl+Alt+J`）；
 2. 列表倒序显示所有轮次，**用内容辨认**（可直接输入关键字过滤）；
-3. 选中 → 约 1~2 秒后提示「已生成「xxx · 分支N」」；
+3. 选中 → 约 1~2 秒后提示「已生成「xxx · 分支N」」（v2 是等宿主回执后才提示，不再是「文件被叼走就算成功」）；
 4. 打开历史列表即可看到新分支，点开继续聊；原对话保持原样、正在跑的任务不受影响。
 
 ### 方案 A 用法
@@ -353,7 +407,7 @@ node %APPDATA%\CodeBuddyBranch\make-archive.js "E:\项目路径" <会话id> 3 "�
 ### 目录
 
 ```
-%APPDATA%\CodeBuddyBranch\
+C:\Users\21078\AppData\Roaming\CodeBuddyBranch\
     extension\              ← 扩展源码（改这里，再同步到扩展目录）
         package.json
         extension.js
@@ -370,18 +424,20 @@ node %APPDATA%\CodeBuddyBranch\make-archive.js "E:\项目路径" <会话id> 3 "�
 ### 常见维护动作
 
 ```powershell
-cd %APPDATA%\CodeBuddyBranch
+cd C:\Users\21078\AppData\Roaming\CodeBuddyBranch
 
 # 看补丁是否还在（IDE 升级后大概率没了）
 node patch-genie.js status
 node patch-genie.js apply
 
 # 回滚补丁
-node patch-genie.js revert "%APPDATA%\CodeBuddyBranch\backup\<备份文件>.js"
+node patch-genie.js revert "C:\Users\21078\AppData\Roaming\CodeBuddyBranch\backup\<备份文件>.js"
 
 # 改完 extension\ 下的文件后，同步到扩展目录并重启 IDE
-Copy-Item "extension\*" "$env:USERPROFILE\.codebuddycn\extensions\local.codebuddy-branch-0.1.0\" -Force
+Copy-Item "extension\*" "$env:USERPROFILE\.codebuddycn\extensions\local.codebuddy-branch-0.2.0\" -Force
 ```
+
+> 扩展目录名必须与 `package.json` 的 `version` 一致（`0.2.0` 对应 `local.codebuddy-branch-0.2.0`）。升级版本号时两个一起改，并删掉旧版本目录，否则会出现两个同名扩展抢快捷键。
 
 ### 升级后必做
 
@@ -393,7 +449,9 @@ Copy-Item "extension\*" "$env:USERPROFILE\.codebuddycn\extensions\local.codebudd
 
 1. `%APPDATA%\CodeBuddyBranch\error.log` —— 命令异常堆栈；
 2. `%APPDATA%\CodeBuddyBranch\probe.log` —— 轮次数、items 数、剪贴板命中情况；
-3. `%TEMP%\codebuddy-branch\pending.json` —— 若一直存在不消失，说明补丁没生效。
+3. `%TEMP%\codebuddy-branch\` —— v2 的队列在这里：`req-<taskId>.json` 迟迟不变名 = 没有窗口认领（目标窗口的补丁没生效，或工作区对不上）；`ack-<taskId>.json` 是结果回执；`import-error.log` 是导入失败的真实堆栈；`imported-*` 是已被取走的任务留档。
+
+> 排查「提示已生成但历史里没有」时，先看 `req-<taskId>.json` 的目标 `__cbbTargetWs`，再去 `%LOCALAPPDATA%\CodeBuddyExtension\Data\*\CodeBuddyIDE\*\<md5>\index.json` 里按名字搜——v1 时代的分支很可能落在**另一个工作区**的历史里。
 
 ---
 
@@ -401,8 +459,8 @@ Copy-Item "extension\*" "$env:USERPROFILE\.codebuddycn\extensions\local.codebudd
 
 - 分支只复制**对话历史**，不复制工作区文件。多条分支同时改同一批文件会互相覆盖（这点 Harness 也一样）。
 - 补丁改的是 IDE 安装目录下的一个 JS 文件，**升级会覆盖**；有备份可随时回滚。
-- 归档文件写在 `%TEMP%`，导入后被改名为 `imported-<时间戳>.json` 留档。
-- 不涉及任何网络请求，所有操作都在本地。
+- 任务文件写在 `%TEMP%\codebuddy-branch\`，导入后被改名为 `imported-<时间戳>-<taskId>.json` 留档；`ack-<taskId>.json` 是回执，读完即删。
+- 不涉及任何网络请求，所有操作都在本地（只有发布到 GitHub 时才会联网）。
 
 ---
 
@@ -414,5 +472,7 @@ Copy-Item "extension\*" "$env:USERPROFILE\.codebuddycn\extensions\local.codebudd
 | 精确分叉（不想找轮次） | 复制那条消息 → `Ctrl+Alt+B` → 回车 |
 | 不打开 IDE 界面分叉 | `node branch-cli.js <轮次> "<项目路径>"` |
 | 只导出某轮为可导入文件 | `node make-archive.js "<项目路径>" <会话id> <轮次> "<输出.json>"` |
-| IDE 升级后修分支 | `node patch-genie.js apply` → 重启 |
-| 彻底卸载 | 删 `~/.codebuddycn/extensions/local.codebuddy-branch-0.1.0` + `patch-genie.js revert <备份>` |
+| IDE 升级后修分支 | `node patch-genie.js apply`（v1 会原地升到 v2）→ 重启 |
+| 彻底卸载 | 删 `~/.codebuddycn/extensions/local.codebuddy-branch-0.2.0` + `patch-genie.js revert <备份>` |
+| 把更新发布到 GitHub | 同步 `%APPDATA%\CodeBuddyBranch` 的改动到桌面 `codebuddy-conversation-branch` → `node pub.js publish`（走 REST API，不依赖 git） |
+| 分支提示"已生成"但历史里没有 | 看 `%TEMP%\codebuddy-branch\import-error.log`；v1 时代是落到别的工作区了（6.1.1） |
