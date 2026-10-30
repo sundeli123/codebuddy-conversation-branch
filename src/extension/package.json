@@ -2,7 +2,7 @@
   "name": "codebuddy-branch",
   "displayName": "CodeBuddy 对话分支",
   "description": "从当前对话的任意一轮分叉出一个新对话（自动导入，不重载、不打断正在跑的任务）",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"
